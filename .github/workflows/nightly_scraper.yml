@@ -1,4 +1,4 @@
-yamlname: carIQ Nightly Scraper
+name: carIQ Nightly Scraper
 on:
   schedule:
     - cron: '30 20 * * *'
