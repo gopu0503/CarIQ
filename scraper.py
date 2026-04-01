@@ -1,12 +1,18 @@
 """
-carIQ Price Intelligence Scraper v3
+carIQ Price Intelligence Scraper v4
 =====================================
-Architecture:
-  Cars24 / Spinny  →  httpx direct API calls (React SPAs, data via API)
-  OLX / CarDekho   →  httpx fetch + BeautifulSoup HTML parsing (SSR pages)
+Data sources:
+  CarDekho  →  JSON-LD ItemList in raw HTML (confirmed SSR, works without cookies)
+  OLX       →  data-aut-id selectors in raw HTML (confirmed SSR, works without cookies)  
+  Cars24    →  httpx API attempts (blocked from datacenter IPs, graceful fallback)
+  Spinny    →  httpx API attempts (blocked from datacenter IPs, graceful fallback)
+
+CarDekho URL pattern: /used-{brand}-{model}+cars+in+{city}
+OLX URL pattern: /cars_c84/q-{brand}-{model}?search[locations][0][name]={city}
 """
 
 import asyncio
+import json
 import re
 import random
 import logging
@@ -29,28 +35,21 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 CITIES = ["mumbai", "delhi", "bangalore", "pune", "hyderabad", "chennai"]
 
-MODELS_TO_TRACK = [
-    {"brand": "maruti", "model": "swift"},
-    {"brand": "maruti", "model": "baleno"},
-    {"brand": "maruti", "model": "wagon-r"},
-    {"brand": "maruti", "model": "dzire"},
-    {"brand": "hyundai", "model": "creta"},
-    {"brand": "hyundai", "model": "i20"},
-    {"brand": "hyundai", "model": "venue"},
-    {"brand": "tata", "model": "nexon"},
-    {"brand": "honda", "model": "city"},
-    {"brand": "kia", "model": "seltos"},
-]
-
-# OLX city name mapping
-OLX_CITY_NAMES = {
-    "mumbai": "mumbai",
-    "delhi": "delhi",
-    "bangalore": "bangalore",
-    "pune": "pune",
-    "hyderabad": "hyderabad",
-    "chennai": "chennai",
+# CarDekho slug mapping — confirmed URL patterns
+CARDEKHO_SLUGS = {
+    ("maruti", "swift"):   "maruti-swift",
+    ("maruti", "baleno"):  "maruti-baleno",
+    ("maruti", "wagon-r"): "maruti-wagon-r",
+    ("maruti", "dzire"):   "maruti-swift-dzire",
+    ("hyundai", "creta"):  "hyundai-creta",
+    ("hyundai", "i20"):    "hyundai-i20-elite",
+    ("hyundai", "venue"):  "hyundai-venue",
+    ("tata", "nexon"):     "tata-nexon",
+    ("honda", "city"):     "honda-city",
+    ("kia", "seltos"):     "kia-seltos",
 }
+
+MODELS_TO_TRACK = list(CARDEKHO_SLUGS.keys())
 
 OLX_TRANSACTION_DISCOUNT = 0.85
 
@@ -61,20 +60,21 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-HEADERS = {
+BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/122.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-IN,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-IN,en;q=0.9,hi;q=0.8",
     "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
-    "Cache-Control": "no-cache",
+    "Upgrade-Insecure-Requests": "1",
+    "Cache-Control": "max-age=0",
 }
 
-API_HEADERS = {**HEADERS, "Accept": "application/json, text/plain, */*"}
+API_HEADERS = {**BROWSER_HEADERS, "Accept": "application/json, text/plain, */*"}
 
 
 @dataclass
@@ -113,22 +113,15 @@ class PrivateListing:
     scraped_at: str
 
 
-# ─────────────────────────────────────────────
-# PRICE PARSING
-# ─────────────────────────────────────────────
-
 def parse_price(text: str) -> Optional[int]:
-    """Parse price strings like '₹6.85 Lakh', '₹ 4,60,000', '685000'"""
     if not text:
         return None
     text = str(text).replace(",", "").strip()
-    # Lakh format: "6.85 Lakh" or "6.85 L"
     m = re.search(r"(\d+\.?\d*)\s*[Ll]akh", text, re.IGNORECASE)
     if not m:
         m = re.search(r"(\d+\.?\d*)\s*[Ll]\b", text)
     if m:
         return int(float(m.group(1)) * 100000)
-    # Plain number
     m = re.search(r"(\d{4,})", text.replace(" ", ""))
     if m:
         val = int(m.group(1))
@@ -136,125 +129,256 @@ def parse_price(text: str) -> Optional[int]:
     return None
 
 
-def parse_km(text: str) -> int:
-    """Parse km strings: '73,000 km', '42960 kms'"""
-    if not text:
-        return 0
-    m = re.search(r"(\d[\d,]*)", text.replace(",", ""))
-    return int(m.group(1)) if m else 0
+# ─────────────────────────────────────────────
+# CARDEKHO — JSON-LD ItemList extraction
+# Confirmed: raw HTML contains full ItemList schema with all 20 cars
+# URL: /used-{slug}+cars+in+{city}
+# ─────────────────────────────────────────────
+
+async def scrape_cardekho(client: httpx.AsyncClient, brand: str, model: str, city: str) -> list:
+    listings = []
+    log.info(f"  CarDekho: {brand} {model} in {city}")
+
+    slug = CARDEKHO_SLUGS.get((brand, model), f"{brand}-{model}")
+    url = f"https://www.cardekho.com/used-{slug}+cars+in+{city}"
+
+    try:
+        resp = await client.get(url, headers=BROWSER_HEADERS, timeout=25)
+        if resp.status_code not in (200, 301, 302):
+            log.warning(f"    CarDekho {resp.status_code} for {url}")
+            return listings
+
+        soup = BeautifulSoup(resp.text, "lxml")
+        now = datetime.now(timezone.utc).isoformat()
+
+        # Extract JSON-LD ItemList — confirmed present in raw HTML
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.string or "")
+                # Handle array of schemas
+                items_list = data if isinstance(data, list) else [data]
+                for item in items_list:
+                    if item.get("@type") == "ItemList" and item.get("itemListElement"):
+                        for car in item["itemListElement"]:
+                            if car.get("@type") != "Car":
+                                continue
+                            try:
+                                price = car.get("offers", {}).get("price")
+                                if not price:
+                                    continue
+                                price_int = int(price)
+                                if price_int < 50000:
+                                    continue
+
+                                km_val = car.get("mileageFromOdometer", {}).get("value", 0)
+                                fuel = car.get("fuelType", "")
+                                transmission = car.get("vehicleTransmission", "")
+                                year = int(car.get("vehicleModelDate", 0) or 0)
+                                name = car.get("name", f"{brand} {model}")
+                                car_url = car.get("url", url)
+
+                                listings.append(PrivateListing(
+                                    source="cardekho",
+                                    brand=brand, model=model,
+                                    variant=name,
+                                    year=year,
+                                    fuel=str(fuel).lower(),
+                                    transmission=str(transmission).lower(),
+                                    km_driven=int(km_val or 0),
+                                    city=city,
+                                    asking_price=price_int,
+                                    seller_type="individual",
+                                    days_listed=0,
+                                    listing_url=car_url,
+                                    scraped_at=now,
+                                ))
+                            except Exception as e:
+                                log.warning(f"    CarDekho car parse error: {e}")
+                        break  # Found ItemList, stop searching
+            except json.JSONDecodeError:
+                continue
+
+    except Exception as e:
+        log.error(f"    CarDekho failed for {brand} {model} {city}: {e}")
+
+    log.info(f"    Got {len(listings)} CarDekho listings")
+    return listings
 
 
 # ─────────────────────────────────────────────
-# SCRAPER 1: CARS24 BUY SECTION (httpx API)
+# OLX — data-aut-id HTML parsing
+# Confirmed: data-aut-id="itemPrice" IS in raw HTML without cookies
+# OLX may timeout from datacenter IPs — handled gracefully
+# ─────────────────────────────────────────────
+
+async def scrape_olx(client: httpx.AsyncClient, brand: str, model: str, city: str) -> list:
+    listings = []
+    log.info(f"  OLX: {brand} {model} in {city}")
+
+    query = f"{brand}-{model}"
+    url = (
+        f"https://www.olx.in/cars_c84/q-{query}"
+        f"?search%5Blocations%5D%5B0%5D%5Bname%5D={city}"
+    )
+
+    try:
+        resp = await client.get(url, headers=BROWSER_HEADERS, timeout=30)
+        if resp.status_code != 200:
+            log.warning(f"    OLX {resp.status_code}")
+            return listings
+
+        soup = BeautifulSoup(resp.text, "lxml")
+        now = datetime.now(timezone.utc).isoformat()
+
+        # Confirmed selector: data-aut-id="itemPrice" spans with price text
+        price_els = soup.select('[data-aut-id="itemPrice"]')
+
+        for price_el in price_els:
+            try:
+                price = parse_price(price_el.get_text())
+                if not price:
+                    continue
+
+                # Walk up to find the listing container
+                container = price_el.parent
+                for _ in range(5):
+                    if container is None:
+                        break
+                    if container.find('[data-aut-id="itemSubTitle"]') or container.select_one('[data-aut-id="itemSubTitle"]'):
+                        break
+                    container = container.parent
+
+                subtitle_el = container.select_one('[data-aut-id="itemSubTitle"]') if container else None
+                title_el = container.select_one('[data-aut-id="itemTitle"]') if container else None
+                link_el = container.find("a", href=True) if container else None
+
+                subtitle = subtitle_el.get_text().strip() if subtitle_el else ""
+                # Subtitle format: "2021 - 73,000 km"
+                year_m = re.search(r"(20\d{2})", subtitle)
+                km_m = re.search(r"([\d,]+)\s*km", subtitle, re.IGNORECASE)
+
+                title = title_el.get_text().strip() if title_el else f"{brand} {model}"
+                href = link_el.get("href", "") if link_el else ""
+                if href and not href.startswith("http"):
+                    href = "https://www.olx.in" + href
+
+                listings.append(PrivateListing(
+                    source="olx",
+                    brand=brand, model=model,
+                    variant=title,
+                    year=int(year_m.group(1)) if year_m else 0,
+                    fuel="petrol",
+                    transmission="manual",
+                    km_driven=int(km_m.group(1).replace(",", "")) if km_m else 0,
+                    city=city,
+                    asking_price=price,
+                    seller_type="individual",
+                    days_listed=0,
+                    listing_url=href,
+                    scraped_at=now,
+                ))
+            except Exception as e:
+                log.warning(f"    OLX item parse error: {e}")
+
+    except Exception as e:
+        log.error(f"    OLX failed for {brand} {model} {city}: {e}")
+
+    log.info(f"    Got {len(listings)} OLX listings")
+    return listings
+
+
+# ─────────────────────────────────────────────
+# CARS24 — API attempts (blocked from datacenter IPs)
 # ─────────────────────────────────────────────
 
 async def scrape_cars24(client: httpx.AsyncClient, brand: str, model: str, city: str) -> list:
     listings = []
     log.info(f"  Cars24: {brand} {model} in {city}")
-
     endpoints = [
-        f"https://www.cars24.com/api/v4/listings?city={city}&make={brand}&model={model}&page=1&size=24",
-        f"https://www.cars24.com/api/v3/used-car/search?city={city}&make={brand}&model={model}&page=1&size=24",
-        f"https://api.cars24.com/buyer-service/v1/car-listing?city={city}&make={brand}&model={model}&page=0&size=24",
+        f"https://api.cars24.com/buyer-service/v2/car?city={city}&make={brand}&model={model}&page=0&size=20",
+        f"https://www.cars24.com/api/car-search?city={city}&make={brand}&model={model}&page=1&size=20",
     ]
-
     for url in endpoints:
         try:
-            resp = await client.get(url, headers=API_HEADERS, timeout=15)
+            resp = await client.get(url, headers=API_HEADERS, timeout=12)
             if resp.status_code != 200:
                 continue
             data = resp.json()
             items = _extract_items(data)
             if not items:
                 continue
-
             now = datetime.now(timezone.utc).isoformat()
-            for item in items[:24]:
-                price_raw = (item.get("price") or item.get("resalePrice")
-                             or item.get("sp") or item.get("askingPrice"))
-                if not price_raw:
-                    continue
-                price = (int(price_raw) if isinstance(price_raw, (int, float))
-                         else parse_price(str(price_raw)))
+            for item in items[:20]:
+                price = item.get("price") or item.get("resalePrice") or item.get("sp")
                 if not price:
+                    continue
+                price_int = int(price) if isinstance(price, (int, float)) else parse_price(str(price))
+                if not price_int:
                     continue
                 listings.append(CertifiedListing(
                     source="cars24", brand=brand, model=model,
-                    variant=str(item.get("variant", item.get("variantName", ""))),
+                    variant=str(item.get("variant", "")),
                     year=int(item.get("year", item.get("modelYear", 0)) or 0),
-                    fuel=str(item.get("fuelType", item.get("fuel", ""))).lower(),
+                    fuel=str(item.get("fuelType", "")).lower(),
                     transmission=str(item.get("transmission", "")).lower(),
                     km_driven=int(item.get("kmDriven", item.get("odometerReading", 0)) or 0),
-                    city=city, asking_price=price,
+                    city=city, asking_price=price_int,
                     certification="200-point checked", warranty_months=12,
                     listing_url=f"https://www.cars24.com/car-details/{item.get('id', '')}",
                     scraped_at=now,
                 ))
             if listings:
                 break
-        except Exception as e:
-            log.warning(f"    Cars24 endpoint failed ({url}): {e}")
-
+        except Exception:
+            pass
     log.info(f"    Got {len(listings)} Cars24 listings")
     return listings
 
 
-# ─────────────────────────────────────────────
-# SCRAPER 2: SPINNY BUY SECTION (httpx API)
-# ─────────────────────────────────────────────
-
 async def scrape_spinny(client: httpx.AsyncClient, brand: str, model: str, city: str) -> list:
     listings = []
     log.info(f"  Spinny: {brand} {model} in {city}")
-
     endpoints = [
-        f"https://www.spinny.com/api/v2/listing/?make={brand.title()}&model={model.title()}&city={city}&page=1&page_size=24",
-        f"https://www.spinny.com/api/v3/cars/?make={brand}&model={model}&city={city}&page=1&size=24",
+        f"https://www.spinny.com/api/v2/listing/?make={brand.title()}&model={model.title()}&city={city}&page=1&page_size=20",
     ]
-
     for url in endpoints:
         try:
-            resp = await client.get(url, headers=API_HEADERS, timeout=15)
+            resp = await client.get(url, headers=API_HEADERS, timeout=12)
             if resp.status_code != 200:
                 continue
             data = resp.json()
             items = _extract_items(data)
             if not items:
                 continue
-
             now = datetime.now(timezone.utc).isoformat()
-            for item in items[:24]:
-                price_raw = (item.get("sp") or item.get("price")
-                             or item.get("selling_price"))
-                if not price_raw:
-                    continue
-                price = (int(price_raw) if isinstance(price_raw, (int, float))
-                         else parse_price(str(price_raw)))
+            for item in items[:20]:
+                price = item.get("sp") or item.get("price") or item.get("selling_price")
                 if not price:
+                    continue
+                price_int = int(price) if isinstance(price, (int, float)) else parse_price(str(price))
+                if not price_int:
                     continue
                 listings.append(CertifiedListing(
                     source="spinny", brand=brand, model=model,
-                    variant=str(item.get("variant", item.get("sub_model", ""))),
+                    variant=str(item.get("variant", "")),
                     year=int(item.get("year", item.get("registration_year", 0)) or 0),
-                    fuel=str(item.get("fuel_type", item.get("fuel", ""))).lower(),
+                    fuel=str(item.get("fuel_type", "")).lower(),
                     transmission=str(item.get("transmission", "")).lower(),
-                    km_driven=int(item.get("km_driven", item.get("kms_driven", 0)) or 0),
-                    city=city, asking_price=price,
+                    km_driven=int(item.get("km_driven", 0) or 0),
+                    city=city, asking_price=price_int,
                     certification="Spinny Assured", warranty_months=12,
-                    listing_url=f"https://www.spinny.com/used-cars/{item.get('slug', item.get('id', ''))}",
+                    listing_url=f"https://www.spinny.com/used-cars/{item.get('slug', '')}",
                     scraped_at=now,
                 ))
             if listings:
                 break
-        except Exception as e:
-            log.warning(f"    Spinny endpoint failed ({url}): {e}")
-
+        except Exception:
+            pass
     log.info(f"    Got {len(listings)} Spinny listings")
     return listings
 
 
 def _extract_items(data) -> list:
-    """Recursively find a list of car items in an API response"""
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
@@ -267,161 +391,6 @@ def _extract_items(data) -> list:
                 if inner:
                     return inner
     return []
-
-
-# ─────────────────────────────────────────────
-# SCRAPER 3: OLX (httpx + BeautifulSoup)
-# Confirmed selectors from live inspection:
-#   li[data-aut-id]           → each listing card
-#   [data-aut-id="itemPrice"] → "₹ 4,60,000"
-#   [data-aut-id="itemTitle"] → "Maruti Suzuki Swift"
-#   [data-aut-id="itemSubTitle"] → "2021 - 73,000 km"
-#   a[href]                   → listing URL
-# ─────────────────────────────────────────────
-
-async def scrape_olx(client: httpx.AsyncClient, brand: str, model: str, city: str) -> list:
-    listings = []
-    log.info(f"  OLX: {brand} {model} in {city}")
-
-    city_name = OLX_CITY_NAMES.get(city, city)
-    query = f"{brand}-{model}"
-    url = (
-        f"https://www.olx.in/cars_c84/q-{query}"
-        f"?search%5Blocations%5D%5B0%5D%5Bname%5D={city_name}"
-    )
-
-    try:
-        resp = await client.get(url, headers=HEADERS, timeout=20)
-        if resp.status_code != 200:
-            log.warning(f"    OLX returned {resp.status_code}")
-            return listings
-
-        soup = BeautifulSoup(resp.text, "lxml")
-        cards = soup.select("li[data-aut-id]")
-        now = datetime.now(timezone.utc).isoformat()
-
-        for card in cards:
-            try:
-                price_el = card.select_one('[data-aut-id="itemPrice"]')
-                title_el = card.select_one('[data-aut-id="itemTitle"]')
-                subtitle_el = card.select_one('[data-aut-id="itemSubTitle"]')
-                link_el = card.select_one("a[href]")
-
-                if not price_el:
-                    continue
-
-                price = parse_price(price_el.get_text())
-                if not price:
-                    continue
-
-                # subtitle format: "2021 - 73,000 km"
-                subtitle = subtitle_el.get_text() if subtitle_el else ""
-                year_m = re.search(r"(20\d{2})", subtitle)
-                km_m = re.search(r"([\d,]+)\s*km", subtitle, re.IGNORECASE)
-                year = int(year_m.group(1)) if year_m else 0
-                km = parse_km(km_m.group(1)) if km_m else 0
-
-                title = title_el.get_text().strip() if title_el else f"{brand} {model}"
-                href = link_el["href"] if link_el else ""
-                if href and not href.startswith("http"):
-                    href = "https://www.olx.in" + href
-
-                listings.append(PrivateListing(
-                    source="olx", brand=brand, model=model,
-                    variant=title, year=year,
-                    fuel="petrol", transmission="manual",
-                    km_driven=km, city=city,
-                    asking_price=price, seller_type="individual",
-                    days_listed=0, listing_url=href,
-                    scraped_at=now,
-                ))
-            except Exception as e:
-                log.warning(f"    OLX card parse error: {e}")
-
-    except Exception as e:
-        log.error(f"    OLX scrape failed for {brand} {model} {city}: {e}")
-
-    log.info(f"    Got {len(listings)} OLX listings")
-    return listings
-
-
-# ─────────────────────────────────────────────
-# SCRAPER 4: CARDEKHO (httpx + BeautifulSoup)
-# Confirmed selectors from live inspection:
-#   .cardColumn                → each listing card
-#   .Price                     → "₹6.85 Lakh"
-#   title text pattern         → "2021 Maruti Swift ZXI\n70,000 kms • Petrol • Manual"
-#   a[href]                    → listing URL
-# ─────────────────────────────────────────────
-
-async def scrape_cardekho(client: httpx.AsyncClient, brand: str, model: str, city: str) -> list:
-    listings = []
-    log.info(f"  CarDekho: {brand} {model} in {city}")
-
-    url = f"https://www.cardekho.com/used-cars+in+{city}/{brand}+{model}"
-
-    try:
-        resp = await client.get(url, headers=HEADERS, timeout=20)
-        if resp.status_code not in (200, 301, 302):
-            log.warning(f"    CarDekho returned {resp.status_code}")
-            return listings
-
-        soup = BeautifulSoup(resp.text, "lxml")
-        cards = soup.select(".cardColumn")
-
-        if not cards:
-            # Fallback selector
-            cards = soup.select(".NewUcExCard")
-
-        now = datetime.now(timezone.utc).isoformat()
-
-        for card in cards:
-            try:
-                price_el = card.select_one(".Price")
-                link_el = card.select_one("a[href]")
-
-                if not price_el:
-                    continue
-
-                price = parse_price(price_el.get_text())
-                if not price:
-                    continue
-
-                # Full card text: "2021 Maruti Suzuki Swift ZXI\n70,000 kms • Petrol • Manual"
-                card_text = card.get_text(" ", strip=True)
-
-                year_m = re.search(r"\b(20\d{2})\b", card_text)
-                km_m = re.search(r"([\d,]+)\s*kms?", card_text, re.IGNORECASE)
-                fuel_m = re.search(r"\b(Petrol|Diesel|CNG|Electric|LPG)\b", card_text, re.IGNORECASE)
-                trans_m = re.search(r"\b(Manual|Automatic|AMT|CVT|DCT)\b", card_text, re.IGNORECASE)
-
-                # Title from h3 or first heading
-                title_el = card.select_one("h3, h2, [class*='title'], [class*='Title']")
-                title = title_el.get_text().strip() if title_el else card_text[:60]
-
-                href = link_el["href"] if link_el else ""
-                if href and not href.startswith("http"):
-                    href = "https://www.cardekho.com" + href
-
-                listings.append(PrivateListing(
-                    source="cardekho", brand=brand, model=model,
-                    variant=title,
-                    year=int(year_m.group(1)) if year_m else 0,
-                    fuel=fuel_m.group(1).lower() if fuel_m else "petrol",
-                    transmission=trans_m.group(1).lower() if trans_m else "manual",
-                    km_driven=parse_km(km_m.group(1)) if km_m else 0,
-                    city=city, asking_price=price,
-                    seller_type="individual", days_listed=0,
-                    listing_url=href, scraped_at=now,
-                ))
-            except Exception as e:
-                log.warning(f"    CarDekho card parse error: {e}")
-
-    except Exception as e:
-        log.error(f"    CarDekho scrape failed for {brand} {model} {city}: {e}")
-
-    log.info(f"    Got {len(listings)} CarDekho listings")
-    return listings
 
 
 # ─────────────────────────────────────────────
@@ -466,7 +435,6 @@ class Database:
         cert_groups = defaultdict(list)
         for l in certified:
             cert_groups[(l["brand"], l["model"], l["year"], l["city"])].append(l["asking_price"])
-
         priv_groups = defaultdict(list)
         for l in private:
             if l.get("seller_type") != "dealer":
@@ -491,12 +459,9 @@ class Database:
                 "brand": brand, "model": model, "year": year, "city": city,
                 "certified_low": min(cp) if cp else None,
                 "certified_high": max(cp) if cp else None,
-                "certified_median": cm,
-                "certified_sample_size": len(cp),
-                "private_asking_low": pp25,
-                "private_asking_high": pp75,
-                "private_asking_median": pm,
-                "private_sample_size": len(pp),
+                "certified_median": cm, "certified_sample_size": len(cp),
+                "private_asking_low": pp25, "private_asking_high": pp75,
+                "private_asking_median": pm, "private_sample_size": len(pp),
                 "realistic_low": int(pp25 * OLX_TRANSACTION_DISCOUNT) if pp25 else None,
                 "realistic_high": int(pm * OLX_TRANSACTION_DISCOUNT) if pm else None,
                 "discount_applied": OLX_TRANSACTION_DISCOUNT,
@@ -522,38 +487,40 @@ class Database:
 
 async def run():
     db = Database()
-    async with httpx.AsyncClient(follow_redirects=True, timeout=20) as client:
-        for car in MODELS_TO_TRACK:
-            brand, model = car["brand"], car["model"]
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        for (brand, model) in MODELS_TO_TRACK:
             for city in CITIES:
                 log.info(f"\n{'='*50}")
                 log.info(f"Scraping: {brand} {model} | {city}")
                 log.info(f"{'='*50}")
 
+                await asyncio.sleep(random.uniform(1.5, 3.0))
+
+                cd = await scrape_cardekho(client, brand, model, city)
+                db.save_private(cd)
+
                 await asyncio.sleep(random.uniform(1.0, 2.0))
-                c24 = await scrape_cars24(client, brand, model, city)
-                db.save_certified(c24)
 
-                await asyncio.sleep(random.uniform(0.5, 1.5))
-                sp = await scrape_spinny(client, brand, model, city)
-                db.save_certified(sp)
-
-                await asyncio.sleep(random.uniform(0.5, 1.5))
                 olx = await scrape_olx(client, brand, model, city)
                 db.save_private(olx)
 
                 await asyncio.sleep(random.uniform(0.5, 1.5))
-                cd = await scrape_cardekho(client, brand, model, city)
-                db.save_private(cd)
 
-    log.info("\nAll scraping done. Computing estimates...")
+                c24 = await scrape_cars24(client, brand, model, city)
+                db.save_certified(c24)
+
+                await asyncio.sleep(random.uniform(0.5, 1.5))
+
+                sp = await scrape_spinny(client, brand, model, city)
+                db.save_certified(sp)
+
+    log.info("\nAll done. Computing estimates...")
     db.compute_estimates()
     log.info("Complete.")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="carIQ Price Scraper v3")
-    parser.add_argument("--source", help="cars24|spinny|olx|cardekho")
+    parser = argparse.ArgumentParser(description="carIQ Price Scraper v4")
     parser.add_argument("--compute-only", action="store_true")
     args = parser.parse_args()
     if args.compute_only:
