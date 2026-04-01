@@ -378,11 +378,17 @@ class Cars24Scraper:
             if isinstance(response_data, list):
                 items = response_data
             elif isinstance(response_data, dict):
-                items = (
-                    response_data.get("data", {}).get("content", [])
-                    or response_data.get("results", [])
-                    or response_data.get("cars", [])
-                )
+                data_val = response_data.get("data", [])
+                if isinstance(data_val, list):
+                    items = data_val
+                elif isinstance(data_val, dict):
+                    items = data_val.get("content", [])
+                else:
+                    items = (
+                        response_data.get("results", [])
+                        or response_data.get("cars", [])
+                        or response_data.get("content", [])
+                    )
             else:
                 items = []
             for item in items[:30]:
