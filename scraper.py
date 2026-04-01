@@ -375,11 +375,16 @@ class Cars24Scraper:
         # Parse the intercepted API responses
         now = datetime.now(timezone.utc).isoformat()
         for response_data in responses:
-            items = (
-                response_data.get("data", {}).get("content", [])
-                or response_data.get("results", [])
-                or response_data.get("cars", [])
-            )
+            if isinstance(response_data, list):
+                items = response_data
+            elif isinstance(response_data, dict):
+                items = (
+                    response_data.get("data", {}).get("content", [])
+                    or response_data.get("results", [])
+                    or response_data.get("cars", [])
+                )
+            else:
+                items = []
             for item in items[:30]:
                 try:
                     price = item.get("price") or item.get("resalePrice")
